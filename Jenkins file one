@@ -1,0 +1,176 @@
+
+pipeline {
+    agent any
+
+    environment {
+        // Tools
+        MAVEN_HOME = tool 'Maven-3.9'
+        JAVA_HOME  = tool 'JDK-17'
+
+        // SonarQube
+        SONARQUBE_ENV = 'Sonar-Server'
+        SONAR_PROJECT_KEY = 'myapp'
+        SONAR_PROJECT_NAME = 'My Application'
+
+        // Nexus
+        NEXUS_URL = 'http://nexus.company.com:8081'
+        NEXUS_REPO = 'maven-releases'
+
+        // Fortify
+        FORTIFY_HOME = '/opt/fortify'
+        FORTIFY_PROJECT = 'MyApp'
+        FORTIFY_VERSION = "1.0-${env.BUILD_NUMBER}"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(daysToKeepStr: '14', numToKeepStr: '20'))
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build & Unit Tests') {
+            steps {
+                sh """
+                    ${MAVEN_HOME}/bin/mvn clean install -DskipTests=false
+                """
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    sh """
+                        ${MAVEN_HOME}/bin/mvn sonar:sonar \
+                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                        -Dsonar.projectName=${SONAR_PROJECT_NAME}
+                    """
+                }
+            }
+        }
+
+        stage('SonarQube Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Fortify SAST Scan') {
+            steps {
+                sh """
+                    ${FORTIFY_HOME}/bin/sourceanalyzer -b ${FORTIFY_PROJECT} -clean
+                    ${FORTIFY_HOME}/bin/sourceanalyzer -b ${FORTIFY_PROJECT} src/ -scan -f fortify-results.fpr
+                """
+            }
+        }
+
+        stage('Upload Fortify Results to SSC') {
+            steps {
+                sh """
+                    ${FORTIFY_HOME}/bin/fortifyclient uploadFPR \
+                        -file fortify-results.fpr \
+                        -project ${FORTIFY_PROJECT} \
+                        -version ${FORTIFY_VERSION}
+                """
+            }
+        }
+
+        stage('Fortify Security Gate') {
+            steps {
+                script {
+                    def analysisResult = sh(
+                        script: """
+                            ${FORTIFY_HOME}/bin/fortifyclient getStatus \
+                                -project ${FORTIFY_PROJECT} \
+                                -version ${FORTIFY_VERSION}
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (analysisResult.contains("Failed")) {
+                        error "❌ Fortify Security Gate FAILED. Stopping pipeline."
+                    }
+                }
+            }
+        }
+
+        stage('Package Artifact') {
+            steps {
+                sh """
+                    ${MAVEN_HOME}/bin/mvn package -DskipTests
+                """
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar'
+                }
+            }
+        }
+
+        stage('Publish to Nexus') {
+            steps {
+                sh """
+                    ${MAVEN_HOME}/bin/mvn deploy \
+                    -Dnexus.url=${NEXUS_URL} \
+                    -Dnexus.repo=${NEXUS_REPO}
+                """
+            }
+        }
+
+        stage('Deploy to DEV Environment') {
+            steps {
+                sh """
+                    ./deploy.sh dev target/*.jar
+                """
+            }
+        }
+
+        stage('Deploy to QA (Approval Required)') {
+            steps {
+                script {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Approve deployment to QA?"
+                    }
+                }
+
+                sh "./deploy.sh qa target/*.jar"
+            }
+        }
+
+        stage('Deploy to PROD (Manual Approval + Change Ticket)') {
+            steps {
+                script {
+                    timeout(time: 60, unit: 'MINUTES') {
+                        input message: "Final approval for PROD deployment?"
+                    }
+                }
+
+                sh "./deploy.sh prod target/*.jar"
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Pipeline completed successfully!"
+            mail to: 'team@company.com',
+                 subject: "SUCCESS: Build #${env.BUILD_NUMBER}",
+                 body: "The CI/CD pipeline for ${SONAR_PROJECT_NAME} completed successfully."
+        }
+        failure {
+            echo "🔥 Pipeline failed!"
+            mail to: 'team@company.com',
+                 subject: "FAILED: Build #${env.BUILD_NUMBER}",
+                 body: "The CI/CD pipeline has failed. Please review Jenkins for details."
+        }
+    }
+}
