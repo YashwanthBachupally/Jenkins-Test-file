@@ -1,0 +1,172 @@
+
+pipeline {
+    agent any
+
+    environment {
+        MAVEN_HOME = tool 'Maven-3.9'
+        JAVA_HOME  = tool 'JDK-17'
+
+        // SonarQube
+        SONARQUBE_ENV = 'Sonar-Server'
+        SONAR_PROJECT_KEY = 'myapp'
+        SONAR_PROJECT_NAME = 'My Application'
+
+        // AWS
+        AWS_DEFAULT_REGION = 'us-east-1'
+        S3_BUCKET = 'myapp-artifacts-bucket'
+
+        // Docker
+        DOCKER_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:${env.BUILD_NUMBER}"
+
+        // Kubernetes (Prod)
+        KOPS_CLUSTER = "prod.mycluster.k8s.local"
+        K8S_NAMESPACE = "prod"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(daysToKeepStr: '14', numToKeepStr: '20'))
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build & Unit Tests') {
+            steps {
+                sh """
+                    ${MAVEN_HOME}/bin/mvn clean install -DskipTests=false
+                """
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    sh """
+                        ${MAVEN_HOME}/bin/mvn sonar:sonar \
+                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                        -Dsonar.projectName=${SONAR_PROJECT_NAME}
+                    """
+                }
+            }
+        }
+
+        stage('SonarQube Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('OWASP or Trivy Scan') {
+            parallel {
+                stage('OWASP Dependency Check') {
+                    steps {
+                        sh """
+                            dependency-check.sh --project myapp --scan . --out owasp-report
+                        """
+                    }
+                }
+                stage('Trivy Image Scan') {
+                    steps {
+                        sh """
+                            docker build -t myapp-temp .
+                            trivy image --exit-code 1 --severity HIGH,CRITICAL myapp-temp || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Package Artifact') {
+            steps {
+                sh """
+                    ${MAVEN_HOME}/bin/mvn package -DskipTests
+                """
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar'
+                }
+            }
+        }
+
+        stage('Upload Artifact to S3') {
+            steps {
+                sh """
+                    aws s3 cp target/*.jar s3://${S3_BUCKET}/builds/${BUILD_NUMBER}/
+                """
+            }
+        }
+
+        stage('Build Docker Image for Lower Environments') {
+            steps {
+                sh """
+                    docker build -t ${DOCKER_IMAGE} .
+                    aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin 123456789012.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                    docker push ${DOCKER_IMAGE}
+                """
+            }
+        }
+
+        stage('Deploy to DEV (Docker)') {
+            steps {
+                sh """
+                    docker run -d -p 8080:8080 ${DOCKER_IMAGE}
+                """
+            }
+        }
+
+        stage('Deploy to QA (Approval Required, Docker)') {
+            steps {
+                script {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Approve deployment to QA?"
+                    }
+                }
+                sh """
+                    docker run -d -p 8081:8080 ${DOCKER_IMAGE}
+                """
+            }
+        }
+
+        stage('Deploy to PROD (Approval Required, K8s via Kops)') {
+            steps {
+                script {
+                    timeout(time: 60, unit: 'MINUTES') {
+                        input message: "Approve deployment to PRODUCTION?"
+                    }
+                }
+
+                sh """
+                    export KUBECONFIG=\$(kops export kubecfg --name ${KOPS_CLUSTER} --state s3://kops-state-store --admin)
+                    
+                    kubectl set image deployment/myapp myapp=${DOCKER_IMAGE} -n ${K8S_NAMESPACE}
+                    kubectl rollout status deployment/myapp -n ${K8S_NAMESPACE}
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Pipeline completed successfully!"
+            mail to: 'team@company.com',
+                 subject: "SUCCESS: Build #${env.BUILD_NUMBER}",
+                 body: "The CI/CD pipeline for ${SONAR_PROJECT_NAME} completed successfully."
+        }
+        failure {
+            echo "🔥 Pipeline failed!"
+            mail to: 'team@company.com',
+                 subject: "FAILED: Build #${env.BUILD_NUMBER}",
+                 body: "The CI/CD pipeline has failed. Please review Jenkins for details."
+        }
+    }
+}
